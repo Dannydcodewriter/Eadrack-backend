@@ -1,0 +1,137 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  fullName  String
+  role      Role     @default(STAFF)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  lastLogin DateTime?
+
+  sales           Sale[]
+  activityLogs    ActivityLog[]
+  stockAdjustments StockAdjustment[]
+  productsCreated Product[]
+  customersCreated Customer[]
+
+  @@map("users")
+}
+
+enum Role {
+  ADMIN
+  STAFF
+}
+
+model Product {
+  id            String   @id @default(uuid())
+  name          String
+  sku           String   @unique
+  category      String
+  initialStock  Int
+  currentStock  Int
+  price         Float
+  reorderLevel  Int      @default(10)
+  supplier      String?
+  description   String?
+  imageUrl      String?
+  createdById   String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  createdBy        User              @relation(fields: [createdById], references: [id])
+  sales            Sale[]
+  stockAdjustments StockAdjustment[]
+
+  @@map("products")
+}
+
+model Customer {
+  id           String       @id @default(uuid())
+  name         String
+  phone        String
+  email        String?
+  businessName String?
+  address      String?
+  customerType CustomerType @default(INDIVIDUAL)
+  createdById  String
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  createdBy User   @relation(fields: [createdById], references: [id])
+  sales     Sale[]
+
+  @@map("customers")
+}
+
+enum CustomerType {
+  INDIVIDUAL
+  BUSINESS
+}
+
+model Sale {
+  id         String   @id @default(uuid())
+  productId  String
+  customerId String
+  staffId    String
+  quantity   Int
+  unitPrice  Float
+  totalPrice Float
+  month      String
+  saleDate   DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  staff    User     @relation(fields: [staffId], references: [id])
+
+  @@map("sales")
+}
+
+model StockAdjustment {
+  id             String         @id @default(uuid())
+  productId      String
+  adjustmentType AdjustmentType
+  quantityChange Int
+  previousStock  Int
+  newStock       Int
+  reason         String?
+  adjustedById   String
+  createdAt      DateTime       @default(now())
+
+  product    Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  adjustedBy User    @relation(fields: [adjustedById], references: [id])
+
+  @@map("stock_adjustments")
+}
+
+enum AdjustmentType {
+  ADDITION
+  SALE
+  CORRECTION
+}
+
+model ActivityLog {
+  id         String   @id @default(uuid())
+  userId     String
+  actionType String
+  entityType String
+  entityId   String?
+  details    String?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("activity_logs")
+}
