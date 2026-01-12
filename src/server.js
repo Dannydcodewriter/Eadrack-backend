@@ -28,6 +28,19 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+const corsOptions = {
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'https://eadrack-frontend-gt8h.vercel.app',  // ✅ Add your Vercel URL
+    'https://*.vercel.app'  // ✅ Allow all Vercel preview deployments
+  ],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+
 // Add this AFTER your middleware section and BEFORE the routes
 app.get("/", (req, res) => {
   res.json({ 
