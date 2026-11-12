@@ -30,27 +30,25 @@ exports.getAllCustomers = async (req, res) => {
 			orderBy: { createdAt: "desc" },
 		});
 
-		// Calculate total spent for each customer
-		const customersWithAnalytics = await Promise.all(
-			customers.map(async (customer) => {
-				const sales = await prisma.sale.findMany({
-					where: { customerId: customer.id },
-				});
+		// Total spent / items for every customer in ONE grouped query
+		// (previously one query per customer, which was slow and could
+		// exhaust the database connection pool).
+		const totals = await prisma.sale.groupBy({
+			by: ["customerId"],
+			where: { customerId: { in: customers.map((c) => c.id) } },
+			_sum: { totalPrice: true, quantity: true },
+		});
+		const totalsByCustomer = new Map(totals.map((t) => [t.customerId, t._sum]));
 
-				const totalSpent = sales.reduce(
-					(sum, sale) => sum + sale.totalPrice,
-					0
-				);
-				const totalItems = sales.reduce((sum, sale) => sum + sale.quantity, 0);
-
-				return {
-					...customer,
-					totalPurchases: customer._count.sales,
-					totalSpent,
-					totalItems,
-				};
-			})
-		);
+		const customersWithAnalytics = customers.map((customer) => {
+			const sum = totalsByCustomer.get(customer.id);
+			return {
+				...customer,
+				totalPurchases: customer._count.sales,
+				totalSpent: sum?.totalPrice ?? 0,
+				totalItems: sum?.quantity ?? 0,
+			};
+		});
 
 		res.json({ customers: customersWithAnalytics });
 	} catch (error) {

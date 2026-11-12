@@ -5,6 +5,7 @@
 	"main": "src/server.js",
 	"scripts": {
 		"start": "node src/server.js",
+		"predev": "prisma generate",
 		"dev": "nodemon src/server.js",
 		"migrate": "npx prisma migrate dev",
 		"studio": "npx prisma studio",
