@@ -313,3 +313,247 @@ exports.getLowStockProducts = async (req, res) => {
 		res.status(500).json({ error: "Failed to get low stock products" });
 	}
 };
+
+// ---------------------------------------------------------------------------
+// Restocking (refilling existing products with newly received goods)
+//
+// A restock increases BOTH currentStock and initialStock. initialStock is
+// therefore "total units ever received", which keeps every
+// `sold = initialStock - currentStock` calculation in the app correct.
+// Each restock is recorded as an ADDITION in stock_adjustments.
+// ---------------------------------------------------------------------------
+
+const MAX_SHIPMENT_ITEMS = 200;
+
+class RestockError extends Error {
+	constructor(status, message) {
+		super(message);
+		this.status = status;
+	}
+}
+
+const cleanText = (value, maxLength = 200) =>
+	typeof value === "string" && value.trim()
+		? value.trim().slice(0, maxLength)
+		: undefined;
+
+const parseQuantity = (value) => {
+	const quantity = Number(value);
+	return Number.isInteger(quantity) && quantity > 0 && quantity <= 1000000
+		? quantity
+		: null;
+};
+
+// Returns undefined when no price was sent, null when the price is invalid.
+const parsePrice = (value) => {
+	if (value === undefined || value === null || value === "") return undefined;
+	const price = Number(value);
+	return Number.isFinite(price) && price >= 0 ? price : null;
+};
+
+const buildReason = ({ reference, supplier, note }) =>
+	[
+		"Restock",
+		reference && `Ref: ${reference}`,
+		supplier && `Supplier: ${supplier}`,
+		note,
+	]
+		.filter(Boolean)
+		.join(" · ");
+
+// Applies one restock line inside a transaction.
+const applyRestock = async (tx, { productId, quantity, price, supplier, reason, userId }) => {
+	const existing = await tx.product.findUnique({ where: { id: productId } });
+	if (!existing) {
+		throw new RestockError(404, "Product not found");
+	}
+
+	const product = await tx.product.update({
+		where: { id: productId },
+		data: {
+			currentStock: { increment: quantity },
+			initialStock: { increment: quantity },
+			...(price !== undefined && { price }),
+			...(supplier && { supplier }),
+		},
+	});
+
+	await tx.stockAdjustment.create({
+		data: {
+			productId,
+			adjustmentType: "ADDITION",
+			quantityChange: quantity,
+			previousStock: product.currentStock - quantity,
+			newStock: product.currentStock,
+			reason,
+			adjustedById: userId,
+		},
+	});
+
+	return { product, previousPrice: existing.price };
+};
+
+// Restock a single product (Admin only)
+// POST /api/products/:id/restock
+// body: { quantity, price?, supplier?, reference?, note? }
+exports.restockProduct = async (req, res) => {
+	try {
+		const { id } = req.params;
+		const quantity = parseQuantity(req.body.quantity);
+		const price = parsePrice(req.body.price);
+		const supplier = cleanText(req.body.supplier);
+		const reference = cleanText(req.body.reference, 100);
+		const note = cleanText(req.body.note, 300);
+
+		if (!quantity) {
+			return res
+				.status(400)
+				.json({ error: "Quantity must be a whole number greater than 0" });
+		}
+		if (price === null) {
+			return res.status(400).json({ error: "Price must be a number of 0 or more" });
+		}
+
+		const { product, previousPrice } = await prisma.$transaction((tx) =>
+			applyRestock(tx, {
+				productId: id,
+				quantity,
+				price,
+				supplier,
+				reason: buildReason({ reference, supplier, note }),
+				userId: req.user.userId,
+			})
+		);
+
+		await logActivity(prisma, req.user.userId, "product_restocked", "product", id, {
+			quantity,
+			newStock: product.currentStock,
+			reference,
+			supplier,
+			...(price !== undefined && price !== previousPrice && { previousPrice, price }),
+		});
+
+		res.json({
+			message: `Added ${quantity} unit(s) to ${product.name}`,
+			product,
+		});
+	} catch (error) {
+		if (error instanceof RestockError) {
+			return res.status(error.status).json({ error: error.message });
+		}
+		console.error("Restock product error:", error);
+		res.status(500).json({ error: "Failed to restock product" });
+	}
+};
+
+// Receive a shipment: restock many products at once, all-or-nothing (Admin only)
+// POST /api/products/restock
+// body: { items: [{ productId, quantity, price? }], supplier?, reference?, note? }
+exports.receiveShipment = async (req, res) => {
+	try {
+		const { items } = req.body;
+		const supplier = cleanText(req.body.supplier);
+		const reference = cleanText(req.body.reference, 100);
+		const note = cleanText(req.body.note, 300);
+
+		if (!Array.isArray(items) || items.length === 0) {
+			return res.status(400).json({ error: "Add at least one product to the shipment" });
+		}
+		if (items.length > MAX_SHIPMENT_ITEMS) {
+			return res
+				.status(400)
+				.json({ error: `A shipment can have at most ${MAX_SHIPMENT_ITEMS} products` });
+		}
+
+		const seen = new Set();
+		const lines = [];
+		for (const [index, item] of items.entries()) {
+			const productId = typeof item?.productId === "string" ? item.productId : "";
+			const quantity = parseQuantity(item?.quantity);
+			const price = parsePrice(item?.price);
+			if (!productId) {
+				return res.status(400).json({ error: `Line ${index + 1}: choose a product` });
+			}
+			if (seen.has(productId)) {
+				return res
+					.status(400)
+					.json({ error: `Line ${index + 1}: this product is already in the shipment` });
+			}
+			if (!quantity) {
+				return res.status(400).json({
+					error: `Line ${index + 1}: quantity must be a whole number greater than 0`,
+				});
+			}
+			if (price === null) {
+				return res
+					.status(400)
+					.json({ error: `Line ${index + 1}: price must be a number of 0 or more` });
+			}
+			seen.add(productId);
+			lines.push({ productId, quantity, price });
+		}
+
+		const reason = buildReason({ reference, supplier, note });
+
+		const products = await prisma.$transaction(
+			async (tx) => {
+				const updated = [];
+				for (const line of lines) {
+					const { product } = await applyRestock(tx, {
+						...line,
+						supplier,
+						reason,
+						userId: req.user.userId,
+					});
+					updated.push(product);
+				}
+				return updated;
+			},
+			{ timeout: 30000 }
+		);
+
+		const totalUnits = lines.reduce((sum, line) => sum + line.quantity, 0);
+
+		await logActivity(prisma, req.user.userId, "shipment_received", "product", null, {
+			reference,
+			supplier,
+			productCount: lines.length,
+			totalUnits,
+		});
+
+		res.json({
+			message: `Received ${totalUnits} unit(s) across ${lines.length} product(s)`,
+			products,
+		});
+	} catch (error) {
+		if (error instanceof RestockError) {
+			return res.status(error.status).json({ error: error.message });
+		}
+		console.error("Receive shipment error:", error);
+		res.status(500).json({ error: "Failed to receive shipment" });
+	}
+};
+
+// Stock history for one product
+// GET /api/products/:id/stock-history?type=ADDITION&limit=50
+exports.getStockHistory = async (req, res) => {
+	try {
+		const { id } = req.params;
+		const type = ["ADDITION", "SALE", "CORRECTION"].includes(req.query.type)
+			? req.query.type
+			: undefined;
+		const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+
+		const history = await prisma.stockAdjustment.findMany({
+			where: { productId: id, ...(type && { adjustmentType: type }) },
+			orderBy: { createdAt: "desc" },
+			take: limit,
+			include: { adjustedBy: { select: { fullName: true } } },
+		});
+
+		res.json({ history });
+	} catch (error) {
+		console.error("Get stock history error:", error);
+		res.status(500).json({ error: "Failed to get stock history" });
+	}
+};
